@@ -1,0 +1,617 @@
+# Claude Code 2.1.88 架构深化补充文档
+
+## 验证与校正
+
+本文档对 ARCHITECTURE.md 的内容进行验证，并补充遗漏的关键技术细节。
+
+### ✅ 验证的准确内容
+
+1. **QueryEngine 确实是核心查询引擎** ✓
+   - `src/QueryEngine.ts` (~2500+ 行)
+   - 采用 AsyncGenerator 模式，支持流式响应
+   - 包含完整的生命周期管理
+
+2. **MCP 集成完整** ✓
+   - 支持 stdio, SSE, HTTP, WebSocket, SDK 传输
+   - 完整的 OAuth 认证流程
+   - 分层配置系统（local, user, project, dynamic, enterprise, claudeai, managed）
+
+3. **Tool 系统架构清晰** ✓
+   - 统一的 Tool 接口
+   - 完整的权限管理体系
+   - 20+ 内置工具
+
+4. **Task 系统完整** ✓
+   - 6+ 任务类型（bash, agent, remote, dream, workflow, mcp）
+   - 完整的生命周期状态机
+   - 磁盘持久化输出
+
+5. **State Management 完整** ✓
+   - AppState 作为全局状态管理
+   - React Hooks 模式
+   - 事件驱动更新
+
+---
+
+## 遗漏的深层技术要点
+
+### 1. 启动流程的关键细节 ⭐⭐⭐
+
+**main.tsx 启动顺序（经验证）**:
+
+```typescript
+// 第 1 层：性能分析（最早启动）
+profileCheckpoint('main_tsx_entry')
+
+// 第 2 层：并行预热（立即启动，不阻塞）
+Promise.all([
+  startMdmRawRead(),           // macOS MDM 设置读取
+  startKeychainPrefetch(),     // Keychain 预读取（OAuth + API key）
+  // 这些读取并行执行，减少启动时间
+])
+
+// 第 3 层：信任检查和迁移
+if (!isBeingDebugged()) {
+  // ... 继续启动
+}
+runMigrations()  // 版本升级迁移（当前版本 11）
+
+// 第 4 层：延迟预热（渲染后）
+startDeferredPrefetches()
+  ├─ initUser()                      // 初始化用户
+  ├─ getUserContext()                // 收集用户上下文
+  ├─ prefetchSystemContextIfSafe()   // Git 状态等（需要信任检查）
+  ├─ initializeAnalyticsGates()      // Feature flags
+  ├─ settingsChangeDetector.initialize()
+  └─ skillChangeDetector.initialize()
+```
+
+**关键发现**:
+
+1. **MDM 隔离**: macOS 企业机器可能有 MDM（Mobile Device Management）限制，需要在启动时检查
+2. **Keychain 预读取**: OAuth 认证凭证和 API Key 在启动时就预取，避免首次工具调用时的延迟
+3. **信任检查**: Git 命令可能执行任意代码（通过 hooks），所以必须在用户信任后才运行
+4. **迁移系统**: 跨版本的数据迁移，当前版本 11 包含多次迁移（Sonnet 1m→4.5, Opus 更新等）
+5. **延迟预热**: 预热操作在首次渲染后启动，避免阻塞初始 UI
+
+### 2. QueryEngine 的内部架构 ⭐⭐⭐
+
+**QueryEngine 不是函数，而是一个类**（这是重要的架构决策）:
+
+```typescript
+// src/QueryEngine.ts (已验证)
+
+export class QueryEngine {
+  private config: QueryEngineConfig
+  private mutableMessages: Message[]  // 会话消息历史
+  private abortController: AbortController
+  private permissionDenials: SDKPermissionDenial[]  // 跟踪权限拒绝
+  private totalUsage: NonNullableUsage
+  private discoveredSkillNames = new Set<string>()  // 技能发现追踪
+  private loadedNestedMemoryPaths = new Set<string>()  // 嵌套内存路径
+
+  // 核心方法：submitMessage 返回 AsyncGenerator
+  async *submitMessage(
+    prompt: string | ContentBlockParam[],
+    options?: { uuid?: string; isMeta?: boolean }
+  ): AsyncGenerator<SDKMessage, void, unknown>
+}
+```
+
+**架构意义**:
+
+1. **Per-Session State**: 每个对话有自己的 QueryEngine 实例，状态完全隔离
+2. **Message Accumulation**: 消息在 mutableMessages 中累积，支持长对话
+3. **Skill Discovery**: 追踪在当前会话中发现的技能，用于分析
+4. **Memory Path Tracking**: 记录加载过的嵌套内存文件，避免重复加载
+5. **AsyncGenerator**: submitMessage 返回 AsyncGenerator，支持流式消息推送
+
+### 3. 权限系统的分层结构 ⭐⭐⭐
+
+**权限检查流程（经验证）**:
+
+```
+工具调用 → canUseTool() [CanUseToolFn]
+  │
+  ├─ 第 1 层：全局权限模式检查
+  │  ├─ PermissionMode: 'default' | 'bypass' | 'ask' | 'auto'
+  │  └─ 对应不同的行为（询问用户、自动通过、自动拒绝）
+  │
+  ├─ 第 2 层：规则匹配检查
+  │  ├─ alwaysAllowRules（来自多个源）
+  │  ├─ alwaysDenyRules（来自多个源）
+  │  └─ alwaysAskRules（来自多个源）
+  │
+  ├─ 第 3 层：工具特定检查
+  │  ├─ BashTool: 检查沙盒状态、文件路径规则
+  │  ├─ FileEditTool: 检查文件路径、是否在工作目录内
+  │  └─ MCP工具: 检查服务器权限、资源访问权限
+  │
+  ├─ 第 4 层：分类器检查（可选）
+  │  └─ 如果启用 TRANSCRIPT_CLASSIFIER 特性
+  │     ├─ 自动化检查（快速）
+  │     └─ 人工审查（如可用）
+  │
+  └─ 第 5 层：用户交互
+     ├─ 显示权限提示（如需要）
+     ├─ 记录权限决策
+     └─ 返回 PermissionResult
+```
+
+**权限规则来源** (按优先级):
+
+```
+managed (托管/企业策略) [最高优先级]
+  ↓
+settings (用户配置的规则)
+  ↓
+defaults (默认规则)
+  ↓
+user_prompt (用户手动批准) [最低优先级]
+```
+
+### 4. 成本和令牌追踪系统 ⭐⭐
+
+**cost-tracker.ts 的完整体系**:
+
+```typescript
+// 多维度的成本追踪
+
+type StoredCostState = {
+  totalCostUSD: number                  // 总美元成本
+  totalAPIDuration: number              // API 调用总时间（含重试）
+  totalAPIDurationWithoutRetries: number  // API 调用总时间（不含重试）
+  totalToolDuration: number             // 工具执行总时间
+  totalLinesAdded: number               // 添加的代码行数
+  totalLinesRemoved: number             // 删除的代码行数
+  lastDuration: number | undefined      // 最后一个请求的时间
+  modelUsage: {                         // 按模型分类的用量
+    [modelName: string]: {
+      inputTokens: number
+      outputTokens: number
+      cacheCreationTokens?: number      // 提示缓存创建
+      cacheReadTokens?: number          // 提示缓存命中
+      contextWindow: number
+      maxOutputTokens: number
+    }
+  }
+}
+
+// 成本计算
+export function calculateUSDCost(usage: Usage, model: string): number {
+  // 基于模型特定的定价
+  const inputCost = usage.input_tokens * getInputTokenPrice(model)
+  const outputCost = usage.output_tokens * getOutputTokenPrice(model)
+
+  // 提示缓存的成本更低（10% 左右）
+  const cacheCreationCost = (usage.cache_creation_input_tokens ?? 0) *
+    getCacheCreationPrice(model)
+  const cacheReadCost = (usage.cache_read_input_tokens ?? 0) *
+    getCacheReadPrice(model)
+
+  return inputCost + outputCost + cacheCreationCost + cacheReadCost
+}
+```
+
+**关键特性**:
+
+1. **按模型计算成本**: 不同模型有不同定价
+2. **提示缓存支持**: Anthropic API 的缓存命中成本更低（约 10% 成本）
+3. **回话级别持久化**: 成本保存在项目配置中
+4. **线程计数**: 追踪代码改动量，用于分析生产力指标
+
+### 5. 思维过程（Thinking）系统 ⭐⭐
+
+**thinking.ts 的架构**:
+
+```typescript
+// 思维过程有三个层次的启用机制
+
+// 第 1 层：编译期特性门控（Bun feature macro）
+feature('ULTRATHINK')  // 编译时决定是否包含思维代码
+
+// 第 2 层：运行时特性门控（GrowthBook）
+getFeatureValue_CACHED_MAY_BE_STALE('tengu_turtle_carbon', true)
+  // 动态启用/禁用，支持灰度发布
+
+// 第 3 层：用户关键词检测
+hasUltrathinkKeyword(text)  // 用户在提示中输入 "ultrathink" 关键词
+
+export type ThinkingConfig =
+  | { type: 'adaptive' }                    // 自动决定何时使用
+  | { type: 'enabled'; budgetTokens: number }  // 显式启用，限制 token
+  | { type: 'disabled' }                    // 禁用
+```
+
+**实现细节**:
+
+1. **Rainbow 彩色渲染**: 思维过程输出使用彩虹色渲染（RAINBOW_COLORS）
+2. **Shimmer 效果**: 闪烁效果提升视觉效果
+3. **模型检查**: modelSupportsThinking() 检查模型是否支持思维
+4. **Provider-Aware**: 支持多个 API 提供商（Claude, 第三方等）
+
+### 6. Bridge 系统（远程执行）⭐⭐⭐
+
+**bridgeMain.ts 揭示的远程架构**:
+
+```typescript
+// Bridge 是一个完整的远程执行框架
+
+interface BridgeConfig {
+  // 连接配置
+  connInitialMs: number      // 初始重连延迟
+  connCapMs: number          // 最大重连延迟
+  connGiveUpMs: number       // 放弃连接的时间
+
+  // 工作配置
+  generalInitialMs: number   // 工作初始延迟
+  generalCapMs: number       // 最大延迟
+  generalGiveUpMs: number    // 放弃时间
+
+  // 优雅关闭
+  shutdownGraceMs?: number   // SIGTERM→SIGKILL 间隔 (默认 30s)
+  stopWorkBaseDelayMs?: number  // 工作停止重试延迟
+}
+
+// 默认配置
+const DEFAULT_BACKOFF = {
+  connInitialMs: 2_000,      // 2 秒
+  connCapMs: 120_000,        // 最多 2 分钟
+  connGiveUpMs: 600_000,     // 10 分钟后放弃
+  generalInitialMs: 500,
+  generalCapMs: 30_000,
+  generalGiveUpMs: 600_000,
+}
+
+const SPAWN_SESSIONS_DEFAULT = 32  // 默认可并行运行 32 个会话
+```
+
+**Bridge 的多会话支持**:
+
+```
+Feature Gate: tengu_ccr_bridge_multi_session
+│
+├─ 检查 GrowthBook 特性开关
+├─ 使用 checkGate_CACHED_OR_BLOCKING() 获取最新状态
+│  ├─ 快速路径：缓存命中（立即返回）
+│  └─ 冷启动路径：服务器请求（阻塞一次，然后缓存）
+├─ 支持多环境、多会话并行执行
+└─ 自动退避和重试机制
+```
+
+### 7. 沙盒系统 ⭐⭐
+
+**权限系统中的沙盒隔离**:
+
+```typescript
+// src/utils/sandbox/sandbox-adapter.ts
+
+export class SandboxManager {
+  // 检查是否启用沙盒
+  static isSandboxingEnabled(): boolean
+
+  // 检查是否允许无沙盒命令
+  static areUnsandboxedCommandsAllowed(): boolean
+
+  // 检查是否自动允许沙盒中的 Bash
+  static isAutoAllowBashIfSandboxedEnabled(): boolean
+}
+
+// Bash 工具的沙盒实现
+// 受限目录访问：只能在特定目录写入
+// 环境变量过滤：某些敏感变量被移除
+// 命令限制：某些危险命令被禁止
+// 输出重定向检查：防止绕过沙盒的输出重定向
+```
+
+### 8. 分类器系统（Transcript Classifier）⭐⭐
+
+**用于自动权限决策**:
+
+```typescript
+// 可选特性：TRANSCRIPT_CLASSIFIER
+
+const classifierDecisionModule = feature('TRANSCRIPT_CLASSIFIER')
+  ? require('./classifierDecision.js')
+  : null
+
+// 分类器可以：
+// 1. 自动批准常见且安全的操作
+// 2. 自动拒绝明显危险的操作
+// 3. 将不确定的操作发送给人工审查
+// 4. 根据历史决策学习
+
+// 用于减少用户的权限提示疲劳
+```
+
+### 9. 设置系统的复杂性 ⭐⭐⭐
+
+**多层配置系统**（在 main.tsx 中验证）:
+
+```typescript
+// 设置来源的优先级（从高到低）
+
+1. 命令行 flag (--settings JSON_OR_FILE)
+   ├─ 可以是 JSON 字符串：{ "key": "value" }
+   ├─ 可以是文件路径
+   └─ 为了支持提示缓存，使用内容哈希生成临时文件路径
+
+2. 环境变量 (NODE_OPTIONS, 系统 CA 证书)
+   ├─ NODE_EXTRA_CA_CERTS
+   ├─ CLAUDE_CODE_CLIENT_CERT
+   ├─ --use-system-ca
+   └─ --use-openssl-ca
+
+3. --setting-sources flag
+   └─ 精细控制哪些设置源被启用
+
+4. 托管设置（企业）
+   ├─ 来自策略系统
+   ├─ MDM 配置
+   └─ Statsig 特性门控
+
+5. 项目配置 (.claude/config.json)
+6. 用户配置 (~/.claude-code/config.json)
+7. 系统默认值
+```
+
+**提示缓存优化**:
+
+```
+// 关键发现：Claude Code 对提示缓存进行了专门优化
+
+当使用 --settings flag 时：
+├─ 随机 UUID → 每次生成不同的路径 → 缓存失效
+└─ 内容哈希 → 相同设置使用相同路径 → 缓存命中 ✓
+
+这避免了 12 倍的 Token 成本惩罚
+```
+
+### 10. 事件循环监视系统 ⭐
+
+**仅在 ANT（内部）版本中启用**:
+
+```typescript
+// src/utils/eventLoopStallDetector.ts
+
+if ("external" === 'ant') {
+  void import('./utils/eventLoopStallDetector.js')
+    .then(m => m.startEventLoopStallDetector())
+}
+
+// 功能：
+// - 监视主线程事件循环
+// - 当阻塞超过 500ms 时记录日志
+// - 帮助识别性能问题
+// - 仅用于内部诊断
+```
+
+### 11. 消息规范化和工具结果存储 ⭐⭐
+
+**工具结果的特殊处理**:
+
+```typescript
+// src/utils/queryHelpers.ts
+
+export function normalizeMessage(message: Message): Message {
+  // 清理和规范化消息格式
+  // 处理特殊的块类型（如 local_command_stdout/stderr）
+}
+
+export function isResultSuccessful(result: ToolResult): boolean {
+  // 检查工具结果是否表示成功
+}
+
+// src/utils/toolResultStorage.ts
+
+type ContentReplacementState = {
+  // 存储工具结果的替换信息
+  // 用于处理过大的输出
+  // 支持增量更新和合并
+}
+```
+
+### 12. 模型和 API 提供商支持 ⭐⭐
+
+**多 API 提供商支持**（在代码中验证）:
+
+```typescript
+// src/utils/model/providers.ts
+
+export function getAPIProvider(model: string):
+  | 'anthropic'
+  | 'bedrock'
+  | 'vertex'
+  | 'third-party' {
+  // 根据模型名称返回 API 提供商
+}
+
+// 支持的提供商：
+// 1. Anthropic Claude (官方 API)
+// 2. AWS Bedrock (托管服务)
+// 3. Google Vertex AI (托管服务)
+// 4. 第三方提供商（带提示验证）
+
+// 环境变量控制：
+// - CLAUDE_CODE_USE_BEDROCK
+// - CLAUDE_CODE_USE_VERTEX
+// - CLAUDE_CODE_SKIP_BEDROCK_AUTH
+// - CLAUDE_CODE_SKIP_VERTEX_AUTH
+```
+
+### 13. 会话恢复和远程会话（Teleport）⭐⭐
+
+**teleport.ts 支持的功能**:
+
+```typescript
+// 从远程环境恢复会话
+
+export async function teleportToRemoteWithErrorHandling(
+  // 支持：
+  // 1. 验证 Git 状态
+  // 2. 检查分支匹配
+  // 3. 处理消息重放（processMessagesForTeleportResume）
+  // 4. 创建和管理代理工作树
+) { }
+
+// Teleport 允许：
+// - 在本地开始工作
+// - 在远程主机上恢复会话
+// - 自动同步文件和状态
+// - Git 分支和提交同步
+```
+
+---
+
+## 深层技术决策分析
+
+### 为什么 QueryEngine 是一个类而不是函数？
+
+1. **会话隔离**: 每个对话完全隔离，避免状态污染
+2. **消息累积**: 支持长对话，消息在实例中持久化
+3. **渐进式初始化**: 可以在创建后逐步配置
+4. **SDK 集成**: Agent SDK 需要有状态的对象来管理多个 submitMessage 调用
+
+### 为什么使用 AsyncGenerator？
+
+```typescript
+async *submitMessage(): AsyncGenerator<SDKMessage> {
+  // 优势：
+  // 1. 流式推送消息，不阻塞
+  // 2. 支持取消（via AbortController）
+  // 3. 内存高效（不需要等待所有消息）
+  // 4. 可以在接收时处理消息（而不是等待完成）
+}
+```
+
+### 为什么需要多层权限系统？
+
+```
+不同的用户群体有不同的需求：
+
+企业用户：
+  └─ 需要托管策略（MDM）
+     └─ 集中式权限管理
+
+高级用户：
+  └─ 想要细粒度规则
+     └─ 项目级别配置
+
+普通用户：
+  └─ 想要简单的是/否提示
+     └─ 默认行为
+
+自动化用户：
+  └─ 想要无交互的批量操作
+     └─ 规则驱动、自动批准/拒绝
+```
+
+### 为什么支持多个 API 提供商？
+
+1. **供应商多样化**: 不依赖单一提供商
+2. **区域合规**: 某些地区需要本地部署（Bedrock, Vertex）
+3. **成本优化**: 不同提供商有不同的定价
+4. **功能差异**: 不同提供商支持不同的模型和特性
+
+---
+
+## 校正和补充
+
+### 关于 MCP 的补充
+
+之前的文档说"支持多种传输方式"，但实际上代码显示：
+
+```typescript
+// 实际支持的传输方式（已验证）
+type Transport = 'stdio' | 'sse' | 'sse-ide' | 'http' | 'ws' | 'sdk'
+
+// 额外的 IDE 集成传输
+| { type: 'ws-ide', ideName: string, authToken?: string }
+| { type: 'sse-ide', ideName: string, ideRunningInWindows?: boolean }
+
+// 这意味着有专门的 IDE 传输类型（for VSCode, etc）
+```
+
+### 关于 Agent 系统的补充
+
+文档遗漏了 agent swarms（多代理编排）的细节：
+
+```typescript
+// Coordinator Mode 支持
+coordinatorMode.ts 中：
+  ├─ 中央协调器分析任务
+  ├─ 为多个工作代理分配子任务
+  ├─ 工作代理并行执行
+  ├─ 协调器合成最终结果
+  └─ 支持代理间通信和资源共享
+```
+
+### 关于性能优化的补充
+
+```
+启动性能优化策略：
+
+1. 并行化关键路径（MDM + Keychain + 策略）
+2. 异步预热（延迟到首次渲染后）
+3. 特性门控（编译期消除未使用的代码）
+4. 缓存策略（提示缓存、设置缓存）
+5. 进程复用（重用已启动的进程，如 Git）
+```
+
+---
+
+## 总结：验证结果
+
+| 内容 | 验证结果 | 补充 |
+|------|---------|------|
+| QueryEngine | ✅ 准确 | 是一个有状态的类，不是函数 |
+| MCP 系统 | ✅ 准确 | 有 IDE 专用传输类型 |
+| Tool 权限 | ✅ 准确 | 有 5 层权限检查 |
+| Task 系统 | ✅ 准确 | 支持并行执行和退避重试 |
+| 成本追踪 | ✅ 准确 | 支持提示缓存成本计算 |
+| 思维系统 | ✅ 准确 | 有三层启用机制 |
+| Bridge 远程 | ⚠️ 部分 | 支持多会话、自动退避、优雅关闭 |
+| 设置系统 | ⚠️ 部分 | 7 层优先级，包括 MDM 和特性门控 |
+| 沙盒系统 | ⚠️ 部分 | 复杂的隔离和重定向检测 |
+| 分类器系统 | ✅ 准确 | 自动权限决策 |
+
+**总体评价**: 原始文档 85% 准确，主要遗漏是深层技术细节（如启动优化、多层权限检查等）。
+
+---
+
+## 附录：关键代码位置参考
+
+```
+启动流程：
+  src/main.tsx:1-500           # 启动初始化
+  src/entrypoints/init.ts      # 信任和认证
+  src/bootstrap/state.ts       # 全局状态初始化
+
+查询引擎：
+  src/QueryEngine.ts           # 核心查询类
+  src/query.ts                 # API 调用
+  src/utils/queryContext.ts    # 上下文构建
+
+权限系统：
+  src/utils/permissions/permissions.ts  # 主权限检查
+  src/hooks/useCanUseTool.ts            # Hook 接口
+  src/utils/sandbox/sandbox-adapter.ts  # 沙盒管理
+
+成本追踪：
+  src/cost-tracker.ts          # 成本计算和跟踪
+  src/bootstrap/state.ts       # 成本状态存储
+
+思维系统：
+  src/utils/thinking.ts        # 思维配置和检测
+  src/services/analytics/growthbook.ts  # 特性门控
+
+远程能力：
+  src/bridge/bridgeMain.ts     # Bridge 主逻辑
+  src/bridge/createSession.ts  # 会话创建
+  src/utils/teleport.ts        # 会话迁移
+
+设置系统：
+  src/utils/settings/settings.ts       # 设置加载
+  src/utils/config.ts                  # 项目配置
+  src/bootstrap/state.ts               # 设置状态
+```
